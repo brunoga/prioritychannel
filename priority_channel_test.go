@@ -2,10 +2,12 @@
 package prioritychannel
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -13,24 +15,23 @@ func TestNewPriorityChannelErrors(t *testing.T) {
 	in := make(chan int)
 	defer close(in) // Close harmlessly if not used
 	lessFunc := func(i, j int) bool { return i < j }
-	timeout := 10 * time.Millisecond
+	ctx := context.Background()
 
 	tests := []struct {
 		name        string
+		ctx         context.Context
 		inChan      chan int
 		lessFunc    func(i, j int) bool
-		timeout     time.Duration
 		expectedErr string
 	}{
-		{"NilInputChannel", nil, lessFunc, timeout, "input channel cannot be nil"},
-		{"NilLessFunc", in, nil, timeout, "lessFunc cannot be nil"},
-		{"ZeroDrainTimeout", in, lessFunc, 0, "drainTimeout must be greater than 0"},
-		{"NegativeDrainTimeout", in, lessFunc, -5 * time.Millisecond, "drainTimeout must be greater than 0"},
+		{"NilContext", nil, in, lessFunc, "context cannot be nil"},
+		{"NilInputChannel", ctx, nil, lessFunc, "input channel cannot be nil"},
+		{"NilLessFunc", ctx, in, nil, "lessFunc cannot be nil"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := New(tt.inChan, tt.lessFunc, tt.timeout)
+			_, err := New(tt.ctx, tt.inChan, tt.lessFunc)
 			if err == nil {
 				t.Fatalf("Expected error '%s', but got nil", tt.expectedErr)
 			}
@@ -44,9 +45,9 @@ func TestNewPriorityChannelErrors(t *testing.T) {
 func TestPriorityChannelBasicOrderMin(t *testing.T) {
 	in := make(chan int)
 	lessFunc := func(i, j int) bool { return i < j }
-	timeout := 50 * time.Millisecond
+	ctx := context.Background()
 
-	out, err := New(in, lessFunc, timeout)
+	out, err := New(ctx, in, lessFunc)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -75,9 +76,9 @@ func TestPriorityChannelBasicOrderMin(t *testing.T) {
 func TestPriorityChannelBasicOrderMax(t *testing.T) {
 	in := make(chan int, 1)
 	lessFunc := func(i, j int) bool { return i > j } // Max priority
-	timeout := 50 * time.Millisecond
+	ctx := context.Background()
 
-	out, err := New(in, lessFunc, timeout)
+	out, err := New(ctx, in, lessFunc)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -103,9 +104,9 @@ func TestPriorityChannelBasicOrderMax(t *testing.T) {
 func TestPriorityChannelEmptyInput(t *testing.T) {
 	in := make(chan string) // Unbuffered
 	lessFunc := func(i, j string) bool { return i < j }
-	timeout := 20 * time.Millisecond
+	ctx := context.Background()
 
-	out, err := New(in, lessFunc, timeout)
+	out, err := New(ctx, in, lessFunc)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -113,6 +114,7 @@ func TestPriorityChannelEmptyInput(t *testing.T) {
 	close(in) // Close input immediately
 
 	// Attempt to read - should block until closed
+	timeout := 20 * time.Millisecond
 	select {
 	case _, ok := <-out:
 		if ok {
@@ -124,104 +126,110 @@ func TestPriorityChannelEmptyInput(t *testing.T) {
 	}
 }
 
-func TestPriorityChannelDrainTimeout(t *testing.T) {
-	in := make(chan int)
-	lessFunc := func(i, j int) bool { return i < j }
-	drainTimeout := 20 * time.Millisecond // Short timeout
+func TestPriorityChannelContextCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		in := make(chan int)
+		lessFunc := func(i, j int) bool { return i < j }
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
 
-	out, err := New(in, lessFunc, drainTimeout)
-	if err != nil {
-		t.Fatalf("New failed: %v", err)
-	}
-
-	// Send items
-	in <- 5
-	in <- 1
-	in <- 3
-	close(in)
-
-	// Read only one item
-	select {
-	case item, ok := <-out:
-		if !ok {
-			t.Fatal("Output channel closed unexpectedly early")
+		out, err := New(ctx, in, lessFunc)
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
 		}
-		if item != 1 {
-			t.Fatalf("Expected first item to be 1, got %d", item)
-		}
-	case <-time.After(drainTimeout * 2):
-		t.Fatal("Timed out waiting for the first item")
-	}
 
-	// Now wait for longer than the drain timeout without reading
-	time.Sleep(drainTimeout * 3)
+		// Send items
+		in <- 5
+		in <- 1
+		in <- 3
+		close(in)
 
-	// Try reading again. The channel should now be closed due to the timeout.
-	select {
-	case item, ok := <-out:
-		if ok {
-			t.Errorf("Expected output channel to be closed due to drain timeout, but received item %d", item)
-		}
-		// Channel closed as expected
-	case <-time.After(10 * time.Millisecond): // Short wait, should be closed already
-		t.Error("Output channel is still open after drain timeout expired")
-	}
-}
-
-func TestPriorityChannelSlowConsumer(t *testing.T) {
-	in := make(chan int)
-	lessFunc := func(i, j int) bool { return i < j }
-	timeout := 100 * time.Millisecond // Longer timeout for slow consumer
-
-	out, err := New(in, lessFunc, timeout)
-	if err != nil {
-		t.Fatalf("New failed: %v", err)
-	}
-
-	items := []int{5, 1, 9, 4, 8, 2, 7, 3, 6, 0}
-	expectedOrder := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-
-	for _, item := range items {
-		in <- item
-	}
-	close(in)
-
-	var receivedItems []int
-	// Read items slowly from output channel
-	for i := 0; i < len(expectedOrder); i++ {
+		// Read only one item
 		select {
 		case item, ok := <-out:
 			if !ok {
-				t.Fatalf("Output channel closed prematurely at index %d", i)
+				t.Fatal("Output channel closed unexpectedly early")
 			}
-			receivedItems = append(receivedItems, item)
-			time.Sleep(10 * time.Millisecond) // Simulate slow processing
-		case <-time.After(timeout * 2):
-			t.Fatalf("Timed out waiting for item at index %d", i)
+			if item != 1 {
+				t.Fatalf("Expected first item to be 1, got %d", item)
+			}
+		case <-time.After(50 * time.Millisecond):
+			t.Fatal("Timed out waiting for the first item")
 		}
-	}
 
-	// Check if channel is closed now
-	select {
-	case _, ok := <-out:
-		if ok {
-			t.Error("Output channel still open after receiving all expected items")
+		// Now wait for longer than the context timeout without reading
+		time.Sleep(30 * time.Millisecond)
+
+		// Try reading again. The channel should now be closed due to context cancellation.
+		select {
+		case item, ok := <-out:
+			if ok {
+				t.Errorf("Expected output channel to be closed due to context cancellation, but received item %d", item)
+			}
+			// Channel closed as expected
+		case <-time.After(10 * time.Millisecond): // Short wait, should be closed already
+			t.Error("Output channel is still open after context timeout expired")
 		}
-	case <-time.After(10 * time.Millisecond):
-		t.Error("Timed out waiting for output channel to close")
-	}
+	})
+}
 
-	if !reflect.DeepEqual(receivedItems, expectedOrder) {
-		t.Errorf("Items received in wrong order with slow consumer.\nExpected: %v\nGot:      %v", expectedOrder, receivedItems)
-	}
+func TestPriorityChannelSlowConsumer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		in := make(chan int)
+		lessFunc := func(i, j int) bool { return i < j }
+		ctx := context.Background()
+
+		out, err := New(ctx, in, lessFunc)
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+
+		items := []int{5, 1, 9, 4, 8, 2, 7, 3, 6, 0}
+		expectedOrder := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+
+		for _, item := range items {
+			in <- item
+		}
+		close(in)
+
+		var receivedItems []int
+		// Read items slowly from output channel
+		timeout := 100 * time.Millisecond
+		for i := 0; i < len(expectedOrder); i++ {
+			select {
+			case item, ok := <-out:
+				if !ok {
+					t.Fatalf("Output channel closed prematurely at index %d", i)
+				}
+				receivedItems = append(receivedItems, item)
+				time.Sleep(10 * time.Millisecond) // Simulate slow processing
+			case <-time.After(timeout * 2):
+				t.Fatalf("Timed out waiting for item at index %d", i)
+			}
+		}
+
+		// Check if channel is closed now
+		select {
+		case _, ok := <-out:
+			if ok {
+				t.Error("Output channel still open after receiving all expected items")
+			}
+		case <-time.After(10 * time.Millisecond):
+			t.Error("Timed out waiting for output channel to close")
+		}
+
+		if !reflect.DeepEqual(receivedItems, expectedOrder) {
+			t.Errorf("Items received in wrong order with slow consumer.\nExpected: %v\nGot:      %v", expectedOrder, receivedItems)
+		}
+	})
 }
 
 func TestPriorityChannelInterleaving(t *testing.T) {
 	in := make(chan int, 5)
 	lessFunc := func(i, j int) bool { return i < j }
-	timeout := 50 * time.Millisecond
+	ctx := context.Background()
 
-	out, err := New(in, lessFunc, timeout)
+	out, err := New(ctx, in, lessFunc)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -229,6 +237,7 @@ func TestPriorityChannelInterleaving(t *testing.T) {
 	var receivedItems []int
 	var wg sync.WaitGroup
 	wg.Add(1)
+	timeout := 50 * time.Millisecond
 
 	// Producer and Consumer running interleaved
 	go func() {
@@ -293,9 +302,9 @@ func TestPriorityChannelWithStructs(t *testing.T) {
 	in := make(chan TestPriorityItem, 5)
 	// Higher Priority value means it should come out first (Max Heap behavior)
 	lessFunc := func(i, j TestPriorityItem) bool { return i.Priority > j.Priority }
-	timeout := 50 * time.Millisecond
+	ctx := context.Background()
 
-	out, err := New(in, lessFunc, timeout)
+	out, err := New(ctx, in, lessFunc)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -359,4 +368,83 @@ func TestPriorityChannelWithStructs(t *testing.T) {
 	if !reflect.DeepEqual(finalReceivedIDs, expectedOrderIDs) {
 		t.Errorf("Struct items received in wrong order based on Priority.\nExpected IDs: %v\nGot IDs:      %v", expectedOrderIDs, finalReceivedIDs)
 	}
+}
+
+func TestPriorityChannelExplicitCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		in := make(chan int)
+		lessFunc := func(i, j int) bool { return i < j }
+		ctx, cancel := context.WithCancel(context.Background())
+
+		out, err := New(ctx, in, lessFunc)
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+
+		// Send some items
+		in <- 5
+		in <- 1
+		in <- 3
+
+		// Read one item
+		item := <-out
+		if item != 1 {
+			t.Fatalf("Expected first item to be 1, got %d", item)
+		}
+
+		// Cancel the context explicitly
+		cancel()
+
+		// Also close the input channel to trigger drain phase where cancellation matters
+		close(in)
+
+		// The output channel should close soon after cancellation
+		select {
+		case _, ok := <-out:
+			if ok {
+				t.Error("Expected channel to close after context cancellation")
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Channel did not close within reasonable time after cancellation")
+		}
+	})
+}
+
+func TestPriorityChannelWithDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		in := make(chan int)
+		lessFunc := func(i, j int) bool { return i < j }
+		deadline := time.Now().Add(50 * time.Millisecond)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+
+		out, err := New(ctx, in, lessFunc)
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+
+		// Send items
+		in <- 5
+		in <- 1
+		in <- 3
+
+		// Read one item quickly
+		item := <-out
+		if item != 1 {
+			t.Fatalf("Expected first item to be 1, got %d", item)
+		}
+
+		// Wait for deadline to pass
+		time.Sleep(60 * time.Millisecond)
+
+		// Channel should be closed due to deadline
+		select {
+		case _, ok := <-out:
+			if ok {
+				t.Error("Expected channel to close after deadline")
+			}
+		case <-time.After(10 * time.Millisecond):
+			t.Error("Channel did not close within reasonable time after deadline")
+		}
+	})
 }
