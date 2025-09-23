@@ -3,6 +3,8 @@ package prioritychannel
 import (
 	"fmt"
 	"time"
+
+	"github.com/brunoga/heap"
 )
 
 // New creates and returns an output channel that receives items of type T from
@@ -50,7 +52,7 @@ func New[T any](in <-chan T, lessFunc func(i, j T) bool,
 	go func() {
 		defer close(out)
 
-		h := NewHeap(lessFunc)
+		h := heap.NewHeap(lessFunc)
 
 		for {
 			if h.Len() == 0 {
