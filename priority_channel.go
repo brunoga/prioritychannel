@@ -28,6 +28,74 @@ func (pc *PriorityChannel[T]) PendingItems() int {
 	return heapLen + inputLen
 }
 
+// processItems handles the core processing logic for the priority channel.
+// It processes items from the input channel, maintains them in priority order
+// in the heap, and sends them to the output channel.
+func (pc *PriorityChannel[T]) processItems(ctx context.Context, in <-chan T, out chan<- T) {
+	defer close(out)
+
+	// This flag tracks if the input channel is closed,
+	// so we know when to start draining.
+	var inputClosed bool
+
+	for {
+		// --- 1. Define channels for the select ---
+
+		// 'outChan' is the channel we send to.
+		// It starts as nil (disabled) by default.
+		var outChan chan<- T
+		var topItem T
+
+		// If the heap has items, we enable the 'outChan' case
+		// by pointing it to the real 'out' channel and
+		// peeking at the next item to send.
+		if pc.h.Len() > 0 {
+			topItem = pc.h.Peek()
+			outChan = out // Enable the send case
+		}
+
+		// 'inChan' is the channel we receive from.
+		// If 'inputClosed' is true, we set 'inChan' to nil
+		// to disable the receive case.
+		var inChan <-chan T = in
+		if inputClosed {
+			inChan = nil // Disable the receive case
+		}
+
+		// --- 2. Check for exit condition ---
+
+		// If the input is closed AND the heap is empty,
+		// we are done draining and can exit.
+		if inputClosed && pc.h.Len() == 0 {
+			return
+		}
+
+		// --- 3. Dynamically select on active channels ---
+
+		select {
+		case <-ctx.Done():
+			// Context was cancelled, exit immediately
+			return
+
+		case item, ok := <-inChan: // Case is disabled if inChan is nil
+			if !ok {
+				// Input channel is now closed. Set the flag.
+				// The loop will repeat, and 'inChan' will be nil
+				// from now on, effectively starting the drain.
+				inputClosed = true
+			} else {
+				// Got a new item, add it to the heap.
+				pc.h.Push(item)
+			}
+
+		case outChan <- topItem: // Case is disabled if outChan is nil
+			// We successfully sent the highest-priority item.
+			// Pop it from the heap.
+			pc.h.Pop()
+		}
+	}
+}
+
 // New creates and returns a PriorityChannel that receives items of type T from
 // the input channel `in` and sends them out in priority order, determined by
 // `lessFunc`.
@@ -75,62 +143,7 @@ func New[T any](ctx context.Context, in <-chan T, lessFunc func(i, j T) bool) (*
 		h:  h,
 	}
 
-	go func() {
-		defer close(out)
-
-		for {
-			if h.Len() == 0 {
-				// The heap is empty. Wait for an item to be pushed, for the
-				// channel to be closed, or for context cancellation.
-				select {
-				case item, ok := <-in:
-					if !ok {
-						// The input channel is closed. Return.
-						return
-					}
-					// There is an input item. Push it to the heap.
-					h.Push(item)
-				case <-ctx.Done():
-					// Context cancelled, return immediately
-					return
-				}
-			} else {
-				// Get next item from the heap.
-				topItem := h.Peek()
-
-				// The heap is not empty. Wait for an item to be pushed, for the
-				// output channel to be ready, for the input channel to be closed,
-				// or for context cancellation.
-				select {
-				case item, ok := <-in:
-					if !ok {
-						// Input channel closed, try to drain remaining items
-						for h.Len() > 0 {
-							topItem := h.Peek()
-							select {
-							case out <- topItem:
-								// The item was sent to the output.
-								h.Pop()
-							case <-ctx.Done():
-								// Context cancelled during drain, drop remaining items
-								return
-							}
-						}
-						// All items drained successfully
-						return
-					}
-					// There is an input item. Push it to the heap.
-					h.Push(item)
-				case out <- topItem:
-					// The item was sent to the output.
-					h.Pop()
-				case <-ctx.Done():
-					// Context cancelled, return immediately
-					return
-				}
-			}
-		}
-	}()
+	go pc.processItems(ctx, in, out)
 
 	return pc, nil
 }
